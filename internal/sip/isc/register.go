@@ -1,3 +1,7 @@
+// Modified by itskimffs (2026-10), see NOTICE: third-party REGISTER keeps the S-CSCF port from Via.
+// This file is part of vectorcore-smsc, licensed under the Apache License,
+// Version 2.0 (see LICENSE).
+
 package isc
 
 import (

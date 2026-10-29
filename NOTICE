@@ -1,0 +1,8 @@
+vectorcore-smsc
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This is a fork of github.com/vectorcore-mobile/vectorcore-smsc (upstream commit 790790a),
+maintained by itskimffs.
+
+Modifications in this fork (itskimffs, 2026-10); each modified file carries a notice:
+- ISC third-party REGISTER keeps the S-CSCF port from the Via header, so MT MESSAGEs reach an S-CSCF on a non-default port (internal/sip/isc/register.go)
