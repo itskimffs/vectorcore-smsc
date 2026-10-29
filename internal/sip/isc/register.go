@@ -1,3 +1,7 @@
+// Modified by itskimffs (2026-10), see NOTICE: third-party REGISTER keeps the S-CSCF port from Via.
+// This file is part of vectorcore-smsc, licensed under the Apache License,
+// Version 2.0 (see LICENSE).
+
 package isc
 
 import (
@@ -102,6 +106,11 @@ func (h *RegisterHandler) HandleRegister(req *sip.Request, tx sip.ServerTransact
 	scscf := ""
 	if via := req.Via(); via != nil {
 		scscf = via.Host
+		// Keep the S-CSCF port: MT MESSAGEs are routed to "sip:<scscf>;lr", and an
+		// S-CSCF on a non-default port (e.g. Kamailio on 6060) is unreachable on 5060.
+		if via.Port > 0 {
+			scscf = via.Host + ":" + strconv.Itoa(via.Port)
+		}
 	}
 
 	expiry := time.Now().Add(time.Duration(expires) * time.Second)
