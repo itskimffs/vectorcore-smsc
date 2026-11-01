@@ -458,6 +458,12 @@ func bindCmds(bindType string) (reqCmd, respCmd uint32) {
 
 var smppMsgIDCounter atomic.Uint64
 
+// Modified by itskimffs (2026-11): the counter starts at the start time in nanoseconds instead of 0. Starting
+// at 0 gave the same message IDs after every restart, so a delivery receipt matched several stored messages
+// in an ESME (KimTel API) that keeps the IDs. 16 hex digits hold a uint64, and the start time keeps the IDs
+// increasing across restarts.
+func init() { smppMsgIDCounter.Store(uint64(time.Now().UnixNano())) }
+
 func generateMsgID() string {
 	id := smppMsgIDCounter.Add(1)
 	return msgIDHex(id)
