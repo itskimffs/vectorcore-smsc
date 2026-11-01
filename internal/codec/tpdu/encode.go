@@ -253,12 +253,15 @@ func encodeAddress(addr codec.Address) ([]byte, error) {
 }
 
 // encodeAlphaAddress encodes an alphanumeric sender ID as a GSM7 address field.
+// Modified by itskimffs (2026-11): the Address-Length is the number of useful semi-octets in the
+// Address-Value (TS 23.040 9.1.2.5), not the number of septets. With the septet count the phone read
+// too short an address (only the first character of "kim") and every later TPDU field shifted.
 func encodeAlphaAddress(alpha string) ([]byte, error) {
 	packed, septets := EncodeGSM7(alpha)
 	// TOA: type=alphanumeric (101), NPI=unknown (0000)
 	toa := byte(0xD0) // 1 101 0000
 	out := make([]byte, 2+len(packed))
-	out[0] = byte(septets) // numDigits = number of septets
+	out[0] = byte((septets*7 + 3) / 4) // useful semi-octets: 7 bits per septet, rounded up to whole semi-octets
 	out[1] = toa
 	copy(out[2:], packed)
 	return out, nil
