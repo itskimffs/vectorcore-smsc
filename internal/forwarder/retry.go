@@ -88,12 +88,19 @@ func (r *RetryScheduler) retryMessage(ctx context.Context, m store.Message, msg 
 	if m.DeferredReason == "sgd_alert_retry" && m.DeferredInterface == string(codec.InterfaceSGd) {
 		route, err := r.f.tryRouteAt(ctx, msg, m.RouteCursor)
 		if err != nil {
-			return routingPassResult{
+			result := routingPassResult{
 				outcome:       passOutcomeWaitTimer,
 				lastAttempted: route,
 				timerRoute:    route,
 				lastErr:       err,
 			}
+			switch classifyRouteError(route, err) {
+			case routeOutcomeRejected:
+				result.outcome = passOutcomeFailed
+			case routeOutcomeBusy:
+				result.retryAfter = sgdBusyRetryDelay
+			}
+			return result
 		}
 		return routingPassResult{
 			outcome:        passOutcomeDelivered,
@@ -109,43 +116,50 @@ func (r *RetryScheduler) finalizeNonDelivered(ctx context.Context, m store.Messa
 	case passOutcomeWaitTimer:
 		r.f.markDeferred(ctx, m.ID, msg, m.RouteCursor, result.lastAttempted)
 		r.f.applyDeferredExpiryCap(ctx, m.ID, m.SubmittedAt, result.lastAttempted)
-		r.scheduleOrFail(ctx, m, result.lastAttempted)
+		if result.retryAfter > 0 {
+			// Busy: retry soon without consuming the retry budget.
+			if err := r.f.st.UpdateMessageRetry(ctx, m.ID, m.RetryCount, time.Now().Add(result.retryAfter), deferredRouteCursor(result.lastAttempted)); err != nil {
+				slog.Error("retry: update busy retry failed", "id", m.ID, "err", err)
+			}
+		} else {
+			r.scheduleOrFail(ctx, m, result.lastAttempted, result.lastErr)
+		}
+		// An alert-triggered retry that finds the subscriber absent again is
+		// returned as a timer wait; the HSS cleared its MWD on the alert, so
+		// report the renewed absence.
+		if classifyRouteError(result.lastAttempted, result.lastErr) == routeOutcomeWaitEvent {
+			r.f.reportSGdAbsent(ctx, m.ID, m.DeferredReason, result.lastAttempted, result.lastErr)
+		}
 	case passOutcomeWaitEvent:
 		r.f.markDeferred(ctx, m.ID, msg, m.RouteCursor, result.eventRoute)
 		r.f.applyDeferredExpiryCap(ctx, m.ID, m.SubmittedAt, result.eventRoute)
 		if err := r.f.st.UpdateMessageStatus(ctx, m.ID, store.MessageStatusWaitEvent); err != nil {
 			slog.Error("retry: mark wait event failed", "id", m.ID, "err", err)
 		}
+		r.f.reportSGdAbsent(ctx, m.ID, m.DeferredReason, result.eventRoute, result.lastErr)
 	case passOutcomeWaitTimerEvent:
 		r.f.markDeferred(ctx, m.ID, msg, m.RouteCursor, result.eventRoute)
 		r.f.applyDeferredExpiryCap(ctx, m.ID, m.SubmittedAt, result.eventRoute)
-		r.scheduleOrFail(ctx, m, result.eventRoute)
+		r.scheduleOrFail(ctx, m, result.eventRoute, result.lastErr)
 		if err := r.f.st.UpdateMessageStatus(ctx, m.ID, store.MessageStatusWaitTimerEvent); err != nil {
 			slog.Error("retry: mark wait timer-event failed", "id", m.ID, "err", err)
 		}
+		r.f.reportSGdAbsent(ctx, m.ID, m.DeferredReason, result.eventRoute, result.lastErr)
 	case passOutcomeFailed:
 		slog.Warn("retry: max retries exceeded, marking failed", "id", m.ID, "err", result.lastErr)
 		_ = r.f.st.UpdateMessageStatus(ctx, m.ID, store.MessageStatusFailed)
-		if r.f.reporter != nil {
-			if stored, err := r.f.st.GetMessage(ctx, m.ID); err == nil && stored != nil {
-				r.f.reporter.Report(ctx, *stored, "FAILED")
-			}
-		}
+		r.f.reportFailed(ctx, m.ID, result.lastErr)
 	}
 }
 
-func (r *RetryScheduler) scheduleOrFail(ctx context.Context, m store.Message, route *selectedRoute) {
+func (r *RetryScheduler) scheduleOrFail(ctx context.Context, m store.Message, route *selectedRoute, lastErr error) {
 	// Compute next retry using SF policy if available.
 	next := r.nextRetry(ctx, m, route)
 	if next == nil {
 		// Max retries exceeded or no policy — fail permanently.
-		slog.Warn("retry: max retries exceeded, marking failed", "id", m.ID)
+		slog.Warn("retry: max retries exceeded, marking failed", "id", m.ID, "err", lastErr)
 		_ = r.f.st.UpdateMessageStatus(ctx, m.ID, store.MessageStatusFailed)
-		if r.f.reporter != nil {
-			if stored, err := r.f.st.GetMessage(ctx, m.ID); err == nil && stored != nil {
-				r.f.reporter.Report(ctx, *stored, "FAILED")
-			}
-		}
+		r.f.reportFailed(ctx, m.ID, lastErr)
 		return
 	}
 
@@ -230,6 +244,11 @@ func storeToCodecMessage(m store.Message) *codec.Message {
 	}
 	if m.TPMR != nil {
 		msg.TPMR = byte(*m.TPMR)
+	}
+	msg.Kind = codec.MessageKind(store.NormalizeMessageKind(m.Kind))
+	msg.RefMessageID = m.RefMessageID
+	if len(m.RawTPDU) > 0 {
+		msg.RawTPDU = append([]byte(nil), m.RawTPDU...)
 	}
 	if m.ExpiryAt != nil {
 		t := *m.ExpiryAt

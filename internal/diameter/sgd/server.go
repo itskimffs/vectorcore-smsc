@@ -2,6 +2,17 @@
 // IP-SM-GW operation. It handles inbound OFR (MO) requests from the MME,
 // correlates answers to outbound TFR (MT) sends, and sends RSR
 // (delivery report) and Alert-SC back.
+//
+// Naming note: 3GPP TS 29.338 calls MO-Forward-Short-Message "OFR/OFA" and
+// MT-Forward-Short-Message "TFR/TFA". Several identifiers in this codebase use
+// the two names the other way round:
+//
+//	SendOFR, EncodeOFR, buildOFRRequest, OFAResultError → MT-Forward (3GPP TFR/TFA)
+//	HandleTFR, DecodeTFR, EncodeTFR                     → MO-Forward (3GPP OFR)
+//
+// The Diameter command codes (dcodec.CmdMTForwardShortMessage,
+// dcodec.CmdMOForwardShortMessage) are authoritative; log messages keep the
+// historical names.
 package sgd
 
 import (
@@ -19,7 +30,14 @@ import (
 )
 
 const gracefulStopTimeout = 5 * time.Second
-const ofrTimeout = 5 * time.Second
+
+// DefaultTFATimeout is how long SendOFR waits for the MME's
+// MT-Forward-Short-Message-Answer. It covers paging the UE and the NAS
+// round trip, and must stay above the MME's own SMS transaction timeout
+// (30s by default in vectorcore-mme) so the MME's answer, success or
+// failure, arrives before the SMSC gives up and retries.
+const DefaultTFATimeout = 40 * time.Second
+
 // OnMessageFunc is called for each decoded MO/MT message.
 type OnMessageFunc func(msg *codec.Message, peerName string)
 
@@ -34,6 +52,8 @@ type Server struct {
 	localFQDN      string
 	localRealm     string
 	scAddrEncoding string
+	msisdnEncoding sgdcodec.MSISDNEncoding
+	tfaTimeout     time.Duration
 	onMsg          OnMessageFunc
 	onAlertSC      OnAlertServiceCentreFunc
 
@@ -50,13 +70,73 @@ type pendingMORequest struct {
 	req  *dcodec.Message
 }
 
-// OFAResultError captures a non-success SGd OFA result code.
+// TS 29.338 §7.4.3 SGd experimental result codes (Experimental-Result,
+// Vendor-Id 10415) returned in MT-Forward-Short-Message-Answer.
+const (
+	ResultErrorAbsentUser           uint32 = 5550
+	ResultErrorUserBusyForMTSMS     uint32 = 5551
+	ResultErrorFacilityNotSupported uint32 = 5552
+	ResultErrorIllegalUser          uint32 = 5553
+	ResultErrorIllegalEquipment     uint32 = 5554
+	ResultErrorSMDeliveryFailure    uint32 = 5555
+)
+
+// SM-Enumerated-Delivery-Failure-Cause values (TS 29.338 §7.3.5), sent with
+// DIAMETER_ERROR_SM_DELIVERY_FAILURE.
+const (
+	DeliveryFailureMemoryCapacityExceeded uint32 = 0
+	DeliveryFailureEquipmentProtocolError uint32 = 1
+	DeliveryFailureEquipmentNotSMEquipped uint32 = 2
+	DeliveryFailureUnknownServiceCentre   uint32 = 3
+	DeliveryFailureSCCongestion           uint32 = 4
+	DeliveryFailureInvalidSMEAddress      uint32 = 5
+	DeliveryFailureUserNotSCUser          uint32 = 6
+)
+
+// OFAResultError captures a non-success answer to an MT-Forward request
+// (see the naming note in the package doc).
 type OFAResultError struct {
-	ResultCode uint32
+	ResultCode   uint32
+	Experimental bool // ResultCode came from Experimental-Result (vendor 10415)
+	// DeliveryFailureCause is SM-Enumerated-Delivery-Failure-Cause when the
+	// MME sent SM-Delivery-Failure-Cause (with ResultErrorSMDeliveryFailure).
+	DeliveryFailureCause *uint32
 }
 
 func (e *OFAResultError) Error() string {
-	return fmt.Sprintf("sgd: OFA returned result-code %d", e.ResultCode)
+	kind := "result-code"
+	if e.Experimental {
+		kind = "experimental-result-code"
+	}
+	if e.DeliveryFailureCause != nil {
+		return fmt.Sprintf("sgd: OFA returned %s %d (delivery failure cause %d)", kind, e.ResultCode, *e.DeliveryFailureCause)
+	}
+	return fmt.Sprintf("sgd: OFA returned %s %d", kind, e.ResultCode)
+}
+
+// ofaError returns nil for a successful MT-Forward answer, otherwise an
+// *OFAResultError describing the failure.
+func ofaError(ans *dcodec.Message) error {
+	code, experimental, ok := resultCodeExperimental(ans)
+	if !ok {
+		return &OFAResultError{ResultCode: dcodec.DiameterUnableToComply}
+	}
+	if code == dcodec.DiameterSuccess && !experimental {
+		return nil
+	}
+	e := &OFAResultError{ResultCode: code, Experimental: experimental}
+	if grp := ans.FindAVP(dcodec.CodeSMDeliveryFailureCause, dcodec.Vendor3GPP); grp != nil {
+		if children, err := dcodec.DecodeGrouped(grp); err == nil {
+			for _, child := range children {
+				if child.Code == dcodec.CodeSMEnumeratedDeliveryFailureCause && child.VendorID == dcodec.Vendor3GPP {
+					if v, err := child.Uint32(); err == nil {
+						e.DeliveryFailureCause = &v
+					}
+				}
+			}
+		}
+	}
+	return e
 }
 
 // NewServer creates an SGd server.
@@ -67,6 +147,8 @@ func NewServer(transport, listenAddr, localFQDN, localRealm, scAddrEncoding stri
 		localFQDN:      localFQDN,
 		localRealm:     localRealm,
 		scAddrEncoding: scAddrEncoding,
+		msisdnEncoding: sgdcodec.MSISDNEncodingTBCD,
+		tfaTimeout:     DefaultTFATimeout,
 		onMsg:          onMsg,
 		peers:          make(map[string]*diameter.Peer),
 		outboundPeers:  make(map[string]*diameter.Peer),
@@ -245,6 +327,31 @@ func (s *Server) SetOnMessage(fn OnMessageFunc) {
 	s.mu.Unlock()
 }
 
+// SetTFATimeout sets how long SendOFR waits for the MT-Forward answer.
+// Non-positive values keep the current timeout.
+func (s *Server) SetTFATimeout(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	s.mu.Lock()
+	s.tfaTimeout = d
+	s.mu.Unlock()
+}
+
+// SetMSISDNEncoding sets the wire format of SGd MSISDN AVPs: "tbcd"
+// (TS 29.329, default) or "legacy_prefixed" for peers that send len|NOA|TBCD.
+func (s *Server) SetMSISDNEncoding(v string) {
+	s.mu.Lock()
+	s.msisdnEncoding = sgdcodec.NormalizeMSISDNEncoding(v)
+	s.mu.Unlock()
+}
+
+func (s *Server) addressOptions() sgdcodec.AddressOptions {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return sgdcodec.AddressOptions{MSISDN: s.msisdnEncoding, SCAddress: s.scAddrEncoding}
+}
+
 // SetOnAlertServiceCentre sets the callback for inbound SGd ALR requests.
 func (s *Server) SetOnAlertServiceCentre(fn OnAlertServiceCentreFunc) {
 	s.mu.Lock()
@@ -257,6 +364,7 @@ func (s *Server) SetOnAlertServiceCentre(fn OnAlertServiceCentreFunc) {
 func (s *Server) SendOFR(ctx context.Context, msg *codec.Message, mmeHost, scAddr string) error {
 	s.mu.RLock()
 	p, viaProxy := s.selectPeerForMMELocked(mmeHost)
+	tfaTimeout := s.tfaTimeout
 	s.mu.RUnlock()
 	if p == nil {
 		return fmt.Errorf("sgd: no active peer for MME %q", mmeHost)
@@ -275,25 +383,46 @@ func (s *Server) SendOFR(ctx context.Context, msg *codec.Message, mmeHost, scAdd
 	if err := p.Send(req); err != nil {
 		return fmt.Errorf("sgd OFR send: %w", err)
 	}
-	slog.Info("sgd OFR sent", "mme", mmeHost, "dst", msg.Destination.MSISDN, "via_proxy", viaProxy, "peer", peerLogName(p))
+	slog.Info("sgd OFR sent",
+		"id", msg.ID,
+		"kind", msg.KindOrDefault(),
+		"ref_id", msg.RefMessageID,
+		"tp_mr", msg.TPMR,
+		"mme", mmeHost,
+		"dst", msg.Destination.MSISDN,
+		"via_proxy", viaProxy,
+		"peer", peerLogName(p),
+		"hop_by_hop", req.Header.HopByHop,
+	)
 
 	select {
 	case ans := <-replyCh:
 		resultCode := resultCode(ans)
+		ofaErr := ofaError(ans)
 		slog.Debug("sgd OFA received",
+			"id", msg.ID,
+			"kind", msg.KindOrDefault(),
+			"ref_id", msg.RefMessageID,
 			"mme", mmeHost,
 			"dst", msg.Destination.MSISDN,
 			"via_proxy", viaProxy,
 			"peer", peerLogName(p),
 			"hop_by_hop", req.Header.HopByHop,
 			"result_code", resultCode,
+			"err", ofaErr,
 		)
-		if resultCode != dcodec.DiameterSuccess {
-			return &OFAResultError{ResultCode: resultCode}
-		}
-		return nil
-	case <-time.After(ofrTimeout):
-		return fmt.Errorf("sgd: OFA timeout after %s", ofrTimeout)
+		return ofaErr
+	case <-time.After(tfaTimeout):
+		slog.Warn("sgd OFA timeout",
+			"id", msg.ID,
+			"kind", msg.KindOrDefault(),
+			"ref_id", msg.RefMessageID,
+			"mme", mmeHost,
+			"dst", msg.Destination.MSISDN,
+			"hop_by_hop", req.Header.HopByHop,
+			"timeout", tfaTimeout,
+		)
+		return fmt.Errorf("sgd: OFA timeout after %s", tfaTimeout)
 	}
 }
 
@@ -422,7 +551,7 @@ func (s *Server) CompleteMO(messageID string, rpBody []byte) bool {
 }
 
 func (s *Server) handleMOForwardRequest(p *diameter.Peer, req *dcodec.Message) {
-	msg, err := sgdcodec.DecodeTFR(req)
+	msg, err := sgdcodec.DecodeTFRWith(req, s.addressOptions())
 	if err != nil {
 		slog.Error("sgd TFR decode failed", "peer", p.RemoteFQDN, "err", err)
 		sendAnswer(p, req, dcodec.DiameterUnableToComply)
@@ -481,12 +610,19 @@ func resultCode(msg *dcodec.Message) uint32 {
 }
 
 func resultCodeOK(msg *dcodec.Message) (uint32, bool) {
+	code, _, ok := resultCodeExperimental(msg)
+	return code, ok
+}
+
+// resultCodeExperimental returns the Result-Code or, when absent, the
+// Experimental-Result-Code, and whether the latter was used.
+func resultCodeExperimental(msg *dcodec.Message) (code uint32, experimental, ok bool) {
 	if msg == nil {
-		return 0, false
+		return 0, false, false
 	}
 	if rc := msg.FindAVP(dcodec.CodeResultCode, 0); rc != nil {
 		if code, err := rc.Uint32(); err == nil {
-			return code, true
+			return code, false, true
 		}
 	}
 	if exp := msg.FindAVP(dcodec.CodeExperimentalResult, 0); exp != nil {
@@ -498,12 +634,12 @@ func resultCodeOK(msg *dcodec.Message) (uint32, bool) {
 				}
 				code, err := child.Uint32()
 				if err == nil {
-					return code, true
+					return code, true, true
 				}
 			}
 		}
 	}
-	return 0, false
+	return 0, false, false
 }
 
 func buildOFRRequest(localFQDN, localRealm, mmeHost, mmeRealm string, avps []*dcodec.AVP) *dcodec.Message {
@@ -612,7 +748,7 @@ func (s *Server) dispatch(p *diameter.Peer, msg *dcodec.Message) {
 
 	switch {
 	case cmd == dcodec.CmdMTForwardShortMessage && isReq:
-		HandleOFR(p, msg, s.onMsg)
+		HandleOFR(p, msg, s.onMsg, s.addressOptions())
 	case cmd == dcodec.CmdMTForwardShortMessage && !isReq:
 		s.mu.RLock()
 		ch := s.pendingOFR[msg.Header.HopByHop]
