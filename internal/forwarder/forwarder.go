@@ -16,6 +16,7 @@ import (
 	"github.com/svinson1121/vectorcore-smsc/internal/codec"
 	smppcodec "github.com/svinson1121/vectorcore-smsc/internal/codec/smpp"
 	dcodec "github.com/svinson1121/vectorcore-smsc/internal/diameter/codec"
+	"github.com/svinson1121/vectorcore-smsc/internal/diameter/s6c"
 	diametersgd "github.com/svinson1121/vectorcore-smsc/internal/diameter/sgd"
 	"github.com/svinson1121/vectorcore-smsc/internal/metrics"
 	"github.com/svinson1121/vectorcore-smsc/internal/numbering"
@@ -47,6 +48,17 @@ type DeliveryReporter interface {
 	Report(ctx context.Context, m store.Message, status string)
 }
 
+// deferredReporter is implemented by reporters that tell the HSS (RSDS)
+// when an SGd delivery waits for an unreachable subscriber. cause is an
+// SM-Delivery-Cause (absent user or memory capacity exceeded).
+type deferredReporter interface {
+	ReportDeferred(ctx context.Context, m store.Message, cause uint32)
+}
+
+// sgdBusyRetryDelay is the retry delay after the MME reports another MT SMS in
+// progress for the subscriber. Busy retries don't consume the retry budget.
+const sgdBusyRetryDelay = 10 * time.Second
+
 type selectedRoute struct {
 	routeIndex  int
 	egressIface string
@@ -67,6 +79,12 @@ const (
 	routeOutcomeWaitTimer
 	routeOutcomeWaitEvent
 	routeOutcomePermanent
+	// routeOutcomeBusy: the destination has another MT in progress; retry soon.
+	routeOutcomeBusy
+	// routeOutcomeRejected: a definitive refusal for this subscriber/message
+	// (e.g. the handset rejected the TPDU). Ends routing immediately as FAILED,
+	// even when other candidates were merely unavailable.
+	routeOutcomeRejected
 )
 
 type passOutcome int
@@ -86,6 +104,9 @@ type routingPassResult struct {
 	eventRoute     *selectedRoute
 	timerRoute     *selectedRoute
 	lastErr        error
+	// retryAfter overrides the timer-retry delay (and is not counted as a
+	// retry) when set, e.g. after an SGd busy answer.
+	retryAfter time.Duration
 }
 
 // Forwarder dispatches messages to the correct egress interface.
@@ -105,6 +126,7 @@ type Forwarder struct {
 	simpleSender SimpleSender
 	smppMgr      *smppClient.Manager
 	sgdSender    SGdSender
+	sgdDestLocks keyedLocks // serialises SGd MT per destination
 	reporter     DeliveryReporter
 }
 
@@ -210,6 +232,12 @@ func (f *Forwarder) runRoutingPass(ctx context.Context, msg *codec.Message, star
 	base := modulo(startCursor, totalCandidates)
 	var sawRetry bool
 	var sawPermanent bool
+	var sawBusy bool
+	// The IMS candidates (0, 1) being unavailable is retryable, since the
+	// subscriber may register later, unless the HSS doesn't know the
+	// subscriber at all, which rules out IMS as well.
+	var sawIMSUnavailable bool
+	var sawUnknownSubscriber bool
 	var lastErr error
 	var lastAttempted *selectedRoute
 
@@ -226,7 +254,16 @@ func (f *Forwarder) runRoutingPass(ctx context.Context, msg *codec.Message, star
 				lastAttempted = planned
 				lastErr = errors.New(reason)
 			}
-			sawRetry = true
+			switch {
+			case reason == sgdReasonUnknownSubscriber:
+				// Definitive for SGd: try the next route, but don't retry this one.
+				sawPermanent = true
+				sawUnknownSubscriber = true
+			case routeIndex < 2:
+				sawIMSUnavailable = true
+			default:
+				sawRetry = true
+			}
 			continue
 		}
 
@@ -249,7 +286,7 @@ func (f *Forwarder) runRoutingPass(ctx context.Context, msg *codec.Message, star
 			}
 		case routeOutcomeWaitEvent:
 			pass := passOutcomeWaitEvent
-			if sawRetry || sawPermanent {
+			if sawRetry || sawPermanent || sawIMSUnavailable {
 				pass = passOutcomeWaitTimerEvent
 			}
 			return routingPassResult{
@@ -266,6 +303,17 @@ func (f *Forwarder) runRoutingPass(ctx context.Context, msg *codec.Message, star
 			sawPermanent = true
 			lastAttempted = route
 			lastErr = err
+		case routeOutcomeBusy:
+			sawRetry = true
+			sawBusy = true
+			lastAttempted = route
+			lastErr = err
+		case routeOutcomeRejected:
+			return routingPassResult{
+				outcome:       passOutcomeFailed,
+				lastAttempted: route,
+				lastErr:       err,
+			}
 		case routeOutcomeTryNext:
 			sawRetry = true
 			lastAttempted = route
@@ -273,14 +321,21 @@ func (f *Forwarder) runRoutingPass(ctx context.Context, msg *codec.Message, star
 		}
 	}
 
+	if sawIMSUnavailable && !sawUnknownSubscriber {
+		sawRetry = true
+	}
 	switch {
 	case sawRetry:
-		return routingPassResult{
+		result := routingPassResult{
 			outcome:       passOutcomeWaitTimer,
 			timerRoute:    lastAttempted,
 			lastAttempted: lastAttempted,
 			lastErr:       lastErr,
 		}
+		if sawBusy {
+			result.retryAfter = sgdBusyRetryDelay
+		}
+		return result
 	case sawPermanent:
 		return routingPassResult{
 			outcome:       passOutcomeFailed,
@@ -369,8 +424,13 @@ func (f *Forwarder) finalizeRoutingPass(ctx context.Context, msg *codec.Message,
 		f.markDeferred(ctx, msg.ID, msg, startCursor, result.lastAttempted)
 		f.applyDeferredExpiryCap(ctx, msg.ID, now, result.lastAttempted)
 		next := now.Add(30 * time.Second)
+		retryCount := nextRetryCount
+		if result.retryAfter > 0 {
+			next = now.Add(result.retryAfter)
+			retryCount = nextRetryCount - 1 // busy retries don't consume the budget
+		}
 		routeCursor := deferredRouteCursor(result.lastAttempted)
-		if err := f.st.UpdateMessageRetry(ctx, msg.ID, nextRetryCount, next, routeCursor); err != nil {
+		if err := f.st.UpdateMessageRetry(ctx, msg.ID, retryCount, next, routeCursor); err != nil {
 			slog.Error(logPrefix+": schedule retry failed", "id", msg.ID, "err", err)
 		}
 	case passOutcomeWaitEvent:
@@ -379,6 +439,7 @@ func (f *Forwarder) finalizeRoutingPass(ctx context.Context, msg *codec.Message,
 		if err := f.st.UpdateMessageStatus(ctx, msg.ID, store.MessageStatusWaitEvent); err != nil {
 			slog.Error(logPrefix+": mark wait event failed", "id", msg.ID, "err", err)
 		}
+		f.reportSGdAbsent(ctx, msg.ID, "", result.eventRoute, result.lastErr)
 	case passOutcomeWaitTimerEvent:
 		f.markDeferred(ctx, msg.ID, msg, startCursor, result.eventRoute)
 		f.applyDeferredExpiryCap(ctx, msg.ID, now, result.eventRoute)
@@ -391,6 +452,7 @@ func (f *Forwarder) finalizeRoutingPass(ctx context.Context, msg *codec.Message,
 		if err := f.st.UpdateMessageStatus(ctx, msg.ID, store.MessageStatusWaitTimerEvent); err != nil {
 			slog.Error(logPrefix+": mark wait timer-event failed", "id", msg.ID, "err", err)
 		}
+		f.reportSGdAbsent(ctx, msg.ID, "", result.eventRoute, result.lastErr)
 	case passOutcomeFailed:
 		slog.Warn(logPrefix+": routing failed permanently",
 			"dst", msg.Destination.MSISDN,
@@ -398,12 +460,44 @@ func (f *Forwarder) finalizeRoutingPass(ctx context.Context, msg *codec.Message,
 			"err", result.lastErr,
 		)
 		_ = f.st.UpdateMessageStatus(ctx, msg.ID, store.MessageStatusFailed)
-		if f.reporter != nil {
-			if stored, err := f.st.GetMessage(ctx, msg.ID); err == nil && stored != nil {
-				f.reporter.Report(ctx, *stored, "FAILED")
-			}
-		}
+		f.reportFailed(ctx, msg.ID, result.lastErr)
 	}
+}
+
+// reportSGdAbsent tells the HSS that an SGd delivery of messageID is waiting
+// for an unreachable subscriber, so it stores MWD and alerts the SMSC later.
+// priorDeferredReason is the message's deferred_reason before this attempt;
+// "sgd_delivery" means the HSS was already told during this absent episode,
+// so retries don't repeat the RSDS. After an alert retry ("sgd_alert_retry")
+// the HSS has cleared its MWD, so a renewed failure is reported again.
+func (f *Forwarder) reportSGdAbsent(ctx context.Context, messageID, priorDeferredReason string, route *selectedRoute, deliveryErr error) {
+	if route == nil || route.egressIface != string(codec.InterfaceSGd) || priorDeferredReason == "sgd_delivery" {
+		return
+	}
+	reporter, ok := f.reporter.(deferredReporter)
+	if !ok {
+		return
+	}
+	stored, err := f.st.GetMessage(ctx, messageID)
+	if err != nil || stored == nil {
+		slog.Warn("forwarder: RSDS absent skipped, message not found", "id", messageID, "err", err)
+		return
+	}
+	reporter.ReportDeferred(ctx, *stored, deferredDeliveryCause(deliveryErr))
+}
+
+// deferredDeliveryCause maps the SGd failure that deferred delivery to the
+// SM-Delivery-Cause reported to the HSS: memory capacity exceeded (HSS sets
+// MCEF and alerts on memory available) or absent user (MNRF, alert on attach).
+func deferredDeliveryCause(err error) uint32 {
+	var ofaErr *diametersgd.OFAResultError
+	if errors.As(err, &ofaErr) && ofaErr.Experimental &&
+		ofaErr.ResultCode == diametersgd.ResultErrorSMDeliveryFailure &&
+		ofaErr.DeliveryFailureCause != nil &&
+		*ofaErr.DeliveryFailureCause == diametersgd.DeliveryFailureMemoryCapacityExceeded {
+		return dcodec.SMDeliveryCauseMemoryCapacityExceeded
+	}
+	return dcodec.SMDeliveryCauseAbsentUser
 }
 
 func (f *Forwarder) deferredLifetimeForRoute(ctx context.Context, route *selectedRoute) time.Duration {
@@ -632,6 +726,12 @@ func (f *Forwarder) resolveCandidateAt(ctx context.Context, msg *codec.Message, 
 }
 
 func (f *Forwarder) fallbackDecisions(msg *codec.Message) []routing.Decision {
+	// An SMS-STATUS-REPORT is a TPDU for the originating handset; it can only
+	// be delivered over a TPDU-carrying interface (ISC or SGd), never via the
+	// SMPP / SIP SIMPLE fallback rules.
+	if msg.Kind == codec.MessageKindStatusReport {
+		return nil
+	}
 	decisions, err := f.engine.RouteAll(msg)
 	if err != nil {
 		return nil
@@ -734,13 +834,52 @@ func classifyRouteError(route *selectedRoute, err error) routeOutcome {
 		return routeOutcomeWaitTimer
 	case string(codec.InterfaceSGd):
 		var ofaErr *diametersgd.OFAResultError
-		if errors.As(err, &ofaErr) && ofaErr.ResultCode == dcodec.DiameterUnableToDeliver {
-			return routeOutcomeWaitEvent
+		if errors.As(err, &ofaErr) {
+			return classifySGdResult(ofaErr)
 		}
 		return routeOutcomeWaitTimer
 	default:
 		return routeOutcomeWaitTimer
 	}
+}
+
+// classifySGdResult maps an MT-Forward failure (TS 29.338 §5.3.2.4/§7.4.3)
+// to a routing outcome.
+func classifySGdResult(e *diametersgd.OFAResultError) routeOutcome {
+	if !e.Experimental {
+		switch e.ResultCode {
+		case dcodec.DiameterUnableToDeliver: // used by MMEs for absent subscribers
+			return routeOutcomeWaitEvent
+		case dcodec.DiameterTooBusy:
+			return routeOutcomeBusy
+		}
+		return routeOutcomeWaitTimer
+	}
+	switch e.ResultCode {
+	case diametersgd.ResultErrorAbsentUser:
+		return routeOutcomeWaitEvent
+	case diametersgd.ResultErrorUserBusyForMTSMS:
+		return routeOutcomeBusy
+	case diametersgd.ResultErrorIllegalUser, diametersgd.ResultErrorIllegalEquipment:
+		return routeOutcomeRejected
+	case diametersgd.ResultErrorSMDeliveryFailure:
+		if e.DeliveryFailureCause == nil {
+			return routeOutcomeWaitTimer
+		}
+		switch *e.DeliveryFailureCause {
+		case diametersgd.DeliveryFailureMemoryCapacityExceeded:
+			return routeOutcomeWaitEvent // wait for the memory-available alert
+		case diametersgd.DeliveryFailureSCCongestion:
+			return routeOutcomeWaitTimer
+		case diametersgd.DeliveryFailureEquipmentProtocolError,
+			diametersgd.DeliveryFailureEquipmentNotSMEquipped,
+			diametersgd.DeliveryFailureUnknownServiceCentre,
+			diametersgd.DeliveryFailureInvalidSMEAddress,
+			diametersgd.DeliveryFailureUserNotSCUser:
+			return routeOutcomeRejected
+		}
+	}
+	return routeOutcomeWaitTimer
 }
 
 func sipResponseCodeFromError(err error) (int, bool) {
@@ -774,12 +913,22 @@ func modulo(v, size int) int {
 	return v
 }
 
+// sgdReasonUnknownSubscriber is the candidate-skip reason when the HSS
+// answers SRI-SM with user-unknown (Experimental-Result 5001). Unlike other
+// S6c failures it is definitive: the SGd route is not retried, and the
+// message fails unless another route delivers it.
+const sgdReasonUnknownSubscriber = "S6c: subscriber unknown to the HSS"
+
 func (f *Forwarder) resolveSGdTarget(ctx context.Context, msisdn string) (string, string, string, string) {
 	if f.sgdSender == nil {
 		return "", "", "", "SGd sender not configured"
 	}
 	s6cSub, s6cErr := f.reg.S6cLookup(ctx, msisdn)
 	if s6cErr != nil {
+		var unknown *s6c.ErrUnknownUser
+		if errors.As(s6cErr, &unknown) {
+			return "", "", "", sgdReasonUnknownSubscriber
+		}
 		return "", "", "", fmt.Sprintf("S6c lookup failed: %v", s6cErr)
 	}
 	if s6cSub == nil || !s6cSub.LTEAttached || s6cSub.MMEHost == "" {
@@ -816,6 +965,7 @@ func (f *Forwarder) persistMessage(ctx context.Context, msg *codec.Message,
 
 	sm := store.Message{
 		ID:                 msg.ID,
+		TPMR:               tpmrForStore(msg),
 		OriginIface:        string(msg.IngressInterface),
 		OriginPeer:         msg.IngressPeer,
 		SMPPMsgID:          msg.SMPPMsgID,
@@ -832,6 +982,12 @@ func (f *Forwarder) persistMessage(ctx context.Context, msg *codec.Message,
 		DRRequired:         msg.TPSRRequired,
 		SubmittedAt:        now,
 		ExpiryAt:           expiry,
+		Kind:               store.NormalizeMessageKind(string(msg.Kind)),
+		RefMessageID:       msg.RefMessageID,
+	}
+	sm.SMPPRegisteredDelivery = smppRegisteredDeliveryForStore(msg)
+	if len(msg.RawTPDU) > 0 {
+		sm.RawTPDU = append([]byte(nil), msg.RawTPDU...)
 	}
 	switch msg.Encoding {
 	case codec.EncodingBinary:
@@ -851,6 +1007,29 @@ func (f *Forwarder) persistMessage(ctx context.Context, msg *codec.Message,
 	}
 	if err := f.st.SaveMessage(ctx, sm); err != nil {
 		slog.Error("forwarder: persist message failed", "id", msg.ID, "err", err)
+	}
+}
+
+// smppRegisteredDeliveryForStore returns the SMPP registered_delivery field
+// to persist, or nil for messages that did not arrive over SMPP.
+func smppRegisteredDeliveryForStore(msg *codec.Message) *int {
+	if msg.SMPPRegisteredDelivery == nil {
+		return nil
+	}
+	v := int(*msg.SMPPRegisteredDelivery)
+	return &v
+}
+
+// tpmrForStore returns the TP-MR to persist, or nil when the ingress interface
+// does not carry an SMS-SUBMIT TPDU (so NULL means "no TP-MR", not MR=0).
+// The stored TP-MR is required to build an SMS-STATUS-REPORT for the sender.
+func tpmrForStore(msg *codec.Message) *int {
+	switch msg.IngressInterface {
+	case codec.InterfaceSGd, codec.InterfaceSIP3GPP:
+		mr := int(msg.TPMR)
+		return &mr
+	default:
+		return nil
 	}
 }
 
@@ -944,6 +1123,19 @@ func (f *Forwarder) deliverSGd(ctx context.Context, msg *codec.Message, mmeHost 
 	if f.sgdSender == nil {
 		return fmt.Errorf("SGd sender not configured")
 	}
+	// Only one MT transaction per subscriber is possible at the MME
+	// (TS 24.011 CP transactions), so concurrent MTs to the same UE, such as
+	// concatenated parts or their status reports, wait their turn here
+	// instead of colliding with a busy answer.
+	key := msg.Destination.IMSI
+	if key == "" {
+		key = msg.Destination.MSISDN
+	}
+	release, err := f.sgdDestLocks.acquire(ctx, key)
+	if err != nil {
+		return err
+	}
+	defer release()
 	if err := f.sgdSender.SendOFR(ctx, msg, mmeHost, f.scAddr); err != nil {
 		return err
 	}

@@ -80,3 +80,21 @@ func loadTestConfig(t *testing.T, body string) *Config {
 	}
 	return cfg
 }
+
+func TestLoadSGdTFATimeout(t *testing.T) {
+	if got := loadTestConfig(t, "smsc:\n  address: \"+15550000000\"\n").SMSC.SGdTFATimeout; got != 40*time.Second {
+		t.Fatalf("default SGdTFATimeout = %v, want 40s", got)
+	}
+	if got := loadTestConfig(t, "smsc:\n  sgd_tfa_timeout: 45s\n").SMSC.SGdTFATimeout; got != 45*time.Second {
+		t.Fatalf("SGdTFATimeout = %v, want 45s", got)
+	}
+}
+
+func TestLoadSGdMSISDNEncoding(t *testing.T) {
+	if got := loadTestConfig(t, "smsc:\n  address: \"+15550000000\"\n").SMSC.SGdMSISDNEncoding; got != "tbcd" {
+		t.Fatalf("default SGdMSISDNEncoding = %q, want tbcd", got)
+	}
+	if got := loadTestConfig(t, "smsc:\n  sgd_msisdn_encoding: legacy_prefixed\n").SMSC.SGdMSISDNEncoding; got != "legacy_prefixed" {
+		t.Fatalf("SGdMSISDNEncoding = %q, want legacy_prefixed", got)
+	}
+}

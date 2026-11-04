@@ -1,7 +1,9 @@
 package sip3gpp
 
 import (
+	"bytes"
 	"testing"
+	"time"
 
 	"github.com/svinson1121/vectorcore-smsc/internal/codec"
 	"github.com/svinson1121/vectorcore-smsc/internal/codec/tpdu"
@@ -60,5 +62,48 @@ func TestDecodeRPDataUsesTPDestinationAddressForRecipient(t *testing.T) {
 	}
 	if got, want := msg.Destination.NPI, byte(0x01); got != want {
 		t.Fatalf("Destination.NPI = %d, want %d", got, want)
+	}
+}
+
+func TestEncodeCarriesRawTPDUInRPUserData(t *testing.T) {
+	raw := []byte{0x06, 0x2A, 0x0C, 0x91, 0x89, 0x19, 0x00, 0x00, 0x10, 0x11,
+		0x62, 0x01, 0x03, 0x71, 0x25, 0x83, 0x00, 0x62, 0x01, 0x03, 0x71, 0x25, 0x54, 0x00, 0x00}
+
+	body, err := Encode(&codec.Message{Kind: codec.MessageKindStatusReport, RawTPDU: raw}, 0x07, "15550000000")
+	if err != nil {
+		t.Fatalf("Encode() error = %v", err)
+	}
+	if got, want := body[0], byte(rpMTIDataSCtoMS); got != want {
+		t.Fatalf("RP-MTI = 0x%02X, want 0x%02X", got, want)
+	}
+	if got := body[1]; got != 0x07 {
+		t.Fatalf("RP-MR = 0x%02X, want 0x07", got)
+	}
+	// RP-UD is the tail: length octet followed by the TP-DATA.
+	rpUD := body[len(body)-len(raw)-1:]
+	if int(rpUD[0]) != len(raw) || !bytes.Equal(rpUD[1:], raw) {
+		t.Fatalf("RP-UD = % X, want len %d + % X", rpUD, len(raw), raw)
+	}
+}
+
+func rpData(rpMTI byte, tpData []byte) []byte {
+	// RP-MTI, RP-MR, empty RP-OA, empty RP-DA, RP-UD
+	return append([]byte{rpMTI, 0x05, 0x00, 0x00, byte(len(tpData))}, tpData...)
+}
+
+func TestDecodeRPDataUsesDirectionForTPMTI(t *testing.T) {
+	command := []byte{0x02, 0x07, 0x00, 0x00, 0x2A, 0x0C, 0x91, 0x89, 0x19, 0x00, 0x00, 0x10, 0x11, 0x00}
+	if msg, err := Decode(rpData(rpMTIDataMStoSC, command)); err == nil {
+		t.Fatalf("MO RP-DATA with SMS-COMMAND decoded as %+v, want rejection", msg)
+	}
+
+	now := time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
+	report, err := tpdu.EncodeStatusReport(0x2A, codec.Address{MSISDN: "989100000111"}, now, now, tpdu.STReceivedBySME)
+	if err != nil {
+		t.Fatalf("EncodeStatusReport() error = %v", err)
+	}
+	msg, err := Decode(rpData(rpMTIDataSCtoMS, report))
+	if err != nil || msg.TPMR != 0x2A || msg.TPStatus != tpdu.STReceivedBySME {
+		t.Fatalf("MT RP-DATA with SMS-STATUS-REPORT = %+v, %v", msg, err)
 	}
 }

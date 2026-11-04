@@ -9,11 +9,15 @@ import (
 	"crypto/rand"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
+	"github.com/svinson1121/vectorcore-smsc/internal/codec"
 	smppcodec "github.com/svinson1121/vectorcore-smsc/internal/codec/smpp"
+	"github.com/svinson1121/vectorcore-smsc/internal/codec/tpdu"
 	dcodec "github.com/svinson1121/vectorcore-smsc/internal/diameter/codec"
 	s6cdiam "github.com/svinson1121/vectorcore-smsc/internal/diameter/s6c"
+	"github.com/svinson1121/vectorcore-smsc/internal/numbering"
 	"github.com/svinson1121/vectorcore-smsc/internal/smpp"
 	smppClient "github.com/svinson1121/vectorcore-smsc/internal/smpp/client"
 	"github.com/svinson1121/vectorcore-smsc/internal/store"
@@ -29,14 +33,21 @@ type S6cReporter interface {
 	ReportDelivery(msisdn, imsi, scAddr, alertCorrelationID string, cause uint32, diagnostic *uint32) (*s6cdiam.ReportDeliveryResult, error)
 }
 
+// Dispatcher submits a new SMSC-generated message (an SMS-STATUS-REPORT)
+// into the normal forwarding pipeline.
+type Dispatcher interface {
+	Dispatch(ctx context.Context, msg *codec.Message)
+}
+
 // Correlator generates delivery reports for delivered or failed messages
 // and routes them back to the originating interface.
 type Correlator struct {
-	st      store.Store
-	smppMgr *smppClient.Manager
-	smppReg SMPPRegistry
-	s6c     S6cReporter
-	scAddr  string
+	st         store.Store
+	smppMgr    *smppClient.Manager
+	smppReg    SMPPRegistry
+	s6c        S6cReporter
+	dispatcher Dispatcher
+	scAddr     string
 }
 
 // New creates a Correlator.
@@ -46,6 +57,10 @@ func New(st store.Store, smppMgr *smppClient.Manager, smppReg SMPPRegistry, scAd
 
 // SetS6cReporter swaps the active S6c reporter as peer selection changes.
 func (c *Correlator) SetS6cReporter(r S6cReporter) { c.s6c = r }
+
+// SetDispatcher sets the pipeline used to deliver SMS-STATUS-REPORTs. It is
+// a setter because the forwarder is constructed after the correlator.
+func (c *Correlator) SetDispatcher(d Dispatcher) { c.dispatcher = d }
 
 // DrStatus values passed to Report.
 const (
@@ -58,6 +73,17 @@ const (
 // Report records a delivery report for the given message and, if the origin
 // interface supports it, sends the DR back to the originating peer.
 func (c *Correlator) Report(ctx context.Context, m store.Message, status string) {
+	c.report(ctx, m, status, nil)
+}
+
+// ReportFailure is Report for a failed message whose cause is known:
+// tpStatus is used as the TP-ST of the SMS-STATUS-REPORT instead of the
+// generic value for status.
+func (c *Correlator) ReportFailure(ctx context.Context, m store.Message, status string, tpStatus byte) {
+	c.report(ctx, m, status, &tpStatus)
+}
+
+func (c *Correlator) report(ctx context.Context, m store.Message, status string, tpStatus *byte) {
 	dr := store.DeliveryReport{
 		ID:          newUUID(),
 		MessageID:   m.ID,
@@ -71,14 +97,26 @@ func (c *Correlator) Report(ctx context.Context, m store.Message, status string)
 	}
 	c.reportS6c(ctx, m, status)
 
+	if store.NormalizeMessageKind(m.Kind) == store.MessageKindStatusReport {
+		// The outcome of a status report is recorded but never itself
+		// reported on: no SMPP receipt and no further STATUS-REPORT.
+		slog.Info("correlator: status report outcome",
+			"id", m.ID,
+			"ref_id", m.RefMessageID,
+			"dst", m.DstMSISDN,
+			"egress", m.EgressIface,
+			"status", status,
+		)
+		return
+	}
+
 	switch m.OriginIface {
 	case "smpp":
 		c.reportSMPP(ctx, m, status)
+	case "sgd", "sip3gpp":
+		c.reportStatusReport(ctx, m, status, tpStatus)
 	default:
-		// SIP 3GPP STATUS-REPORT and SIP SIMPLE IMDN generation require the
-		// original TP-DATA and the originating peer's SIP contact — those are
-		// handled by the ISC/SIMPLE senders when they complete delivery.
-		// Log only for now; full cross-interface DR for SIP origins is Phase 7.
+		// SIP SIMPLE IMDN generation is not implemented; log only.
 		slog.Info("correlator: DR recorded",
 			"id", m.ID,
 			"origin", m.OriginIface,
@@ -89,14 +127,32 @@ func (c *Correlator) Report(ctx context.Context, m store.Message, status string)
 }
 
 func (c *Correlator) reportS6c(ctx context.Context, m store.Message, status string) {
-	if c.s6c == nil || c.scAddr == "" {
-		return
-	}
 	if m.EgressIface != "sgd" {
 		return
 	}
+	c.sendRSDS(ctx, m, s6cCauseForStatus(status), status)
+}
 
-	cause := s6cCauseForStatus(status)
+// ReportDeferred sends RSDS when an SGd MT attempt is deferred because the
+// subscriber can't take the message now: cause is absent-user or
+// memory-capacity-exceeded. The HSS then stores Message Waiting Data (MNRF or
+// MCEF) and alerts the SMSC (ALR) when the subscriber is reachable again or
+// has memory available (TS 23.040 §10.1, TS 29.338 §5.3.2.4). The forwarder
+// calls this once per episode, not on every retry.
+func (c *Correlator) ReportDeferred(ctx context.Context, m store.Message, cause uint32) {
+	status := "deferred_absent"
+	if cause == dcodec.SMDeliveryCauseMemoryCapacityExceeded {
+		status = "deferred_memory_full"
+	}
+	c.sendRSDS(ctx, m, cause, status)
+}
+
+// sendRSDS reports an MT outcome for m's destination to the HSS over S6c.
+func (c *Correlator) sendRSDS(ctx context.Context, m store.Message, cause uint32, status string) {
+	if c.s6c == nil || c.scAddr == "" {
+		return
+	}
+
 	sub, err := c.st.GetSubscriber(ctx, m.DstMSISDN)
 	if err != nil {
 		slog.Warn("correlator: S6c subscriber lookup failed", "id", m.ID, "dst", m.DstMSISDN, "err", err)
@@ -139,12 +195,132 @@ func s6cCauseForStatus(status string) uint32 {
 	}
 }
 
+// reportStatusReport builds an SMS-STATUS-REPORT for a handset-originated SM
+// whose sender requested one (TP-SRR) and dispatches it as a new MT message
+// to the original sender. The report is routed like any MT (fresh S6c lookup
+// of the sender, store-and-forward, retries) and is independent of the
+// original message's transaction.
+// tpStatus, when set, overrides the TP-ST derived from status.
+func (c *Correlator) reportStatusReport(ctx context.Context, m store.Message, status string, tpStatus *byte) {
+	if !m.DRRequired {
+		return
+	}
+	if c.dispatcher == nil {
+		slog.Warn("correlator: status report requested but no dispatcher configured", "id", m.ID)
+		return
+	}
+	if m.SrcMSISDN == "" || m.DstMSISDN == "" || m.TPMR == nil {
+		slog.Warn("correlator: cannot build status report: original message incomplete",
+			"id", m.ID,
+			"src", m.SrcMSISDN,
+			"dst", m.DstMSISDN,
+			"has_tp_mr", m.TPMR != nil,
+		)
+		return
+	}
+
+	now := time.Now().UTC()
+	// TP-DT is the delivery time for a delivered SM, otherwise the time the
+	// SC gave up on it.
+	dt := now
+	if status == StatusDelivered && m.DeliveredAt != nil {
+		dt = *m.DeliveredAt
+	}
+	scts := m.SubmittedAt
+	if scts.IsZero() {
+		scts = dt
+	}
+	st := tpStatusForDR(status)
+	if tpStatus != nil {
+		st = *tpStatus
+	}
+	mr := byte(*m.TPMR)
+
+	tpData, err := tpdu.EncodeStatusReport(mr, codec.Address{MSISDN: m.DstMSISDN}, scts, dt, st)
+	if err != nil {
+		slog.Error("correlator: encode status report failed", "id", m.ID, "err", err)
+		return
+	}
+
+	report := &codec.Message{
+		ID:           newUUID(),
+		Kind:         codec.MessageKindStatusReport,
+		RefMessageID: m.ID,
+		RawTPDU:      tpData,
+		TPMR:         mr,
+		Source:       codec.Address{MSISDN: strings.TrimPrefix(c.scAddr, "+")},
+		Destination: codec.Address{
+			MSISDN: m.SrcMSISDN,
+			TON:    numbering.TONInternational,
+			NPI:    0x01,
+		},
+		IngressInterface: codec.InterfaceInternal,
+		Timestamp:        now,
+	}
+
+	slog.Info("correlator: dispatching SMS-STATUS-REPORT",
+		"id", report.ID,
+		"ref_id", m.ID,
+		"tp_mr", mr,
+		"dst", m.SrcMSISDN,
+		"recipient", m.DstMSISDN,
+		"status", status,
+		"tp_st", fmt.Sprintf("0x%02X", st),
+	)
+	// Dispatch asynchronously: delivery to the sender involves an S6c lookup
+	// and an SGd round trip that must not hold up the original message.
+	go c.dispatcher.Dispatch(ctx, report)
+}
+
+// tpStatusForDR maps a final DR status to TP-ST (3GPP TS 23.040 §9.2.3.15).
+func tpStatusForDR(status string) byte {
+	switch status {
+	case StatusDelivered:
+		return tpdu.STReceivedBySME
+	case StatusExpired:
+		return tpdu.STPermValidityPeriodExpired
+	case StatusFailed, StatusUndeliv:
+		// Routing failed permanently (e.g. unknown subscriber).
+		return tpdu.STPermNotObtainable
+	default:
+		return tpdu.STPermRemoteProcedureError
+	}
+}
+
+// smppReceiptRequested applies the SMSC delivery receipt bits of SMPP
+// registered_delivery (SMPP v3.4 §5.2.17): 00 no receipt, 01 receipt on
+// success or failure, 10 receipt on failure only. 11 is reserved and treated
+// as 01.
+func smppReceiptRequested(m store.Message, status string) bool {
+	if m.SMPPRegisteredDelivery == nil {
+		// Row stored before registered_delivery was recorded: DRRequired
+		// means mode 01; otherwise send failure receipts only.
+		return status != StatusDelivered || m.DRRequired
+	}
+	switch byte(*m.SMPPRegisteredDelivery) & (smpp.RegDeliverySuccess | smpp.RegDeliveryFailure) {
+	case 0:
+		return false
+	case smpp.RegDeliveryFailure:
+		return status != StatusDelivered
+	default:
+		return true
+	}
+}
+
 // reportSMPP sends an SMPP deliver_sm delivery receipt back to the originating ESME.
 func (c *Correlator) reportSMPP(ctx context.Context, m store.Message, status string) {
 	if c.smppMgr == nil && c.smppReg == nil {
 		return
 	}
 	if m.OriginPeer == "" {
+		return
+	}
+	if !smppReceiptRequested(m, status) {
+		slog.Debug("correlator: SMPP receipt not requested",
+			"peer", m.OriginPeer,
+			"id", m.ID,
+			"status", status,
+		)
 		return
 	}
 
